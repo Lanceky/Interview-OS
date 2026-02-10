@@ -1,46 +1,46 @@
-import React, { useState, useCallback } from "react";
-import {
-  View,
-  Text,
-  StyleSheet,
-  TextInput,
-  TouchableOpacity,
-  ActivityIndicator,
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView,
-  Alert,
-} from "react-native";
-import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
+import { useRouter } from "expo-router";
+import React, { useCallback, useState } from "react";
 import {
-  Colors,
-  DomainColors,
-  Typography,
-  Spacing,
-  Radius,
-  Shadows,
-} from "../../constants/theme";
-import {
-  getRandomQuestion,
-  buildTechPrompt,
-  InterviewResult,
-} from "../../constants/questions";
-import {
-  LearningPathState,
-  TECH_LEARNING_LEVELS,
-  createDefaultLearningState,
-  calculateLevelAvg,
-  shouldUnlockNext,
-  getNextQuestionId,
-  checkBadges,
-  TECH_BADGES,
-  QuestionScore,
-} from "../../constants/learningPath";
+    ActivityIndicator,
+    Alert,
+    KeyboardAvoidingView,
+    Platform,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
+} from "react-native";
 import ResultsView from "../../components/ResultsView";
-import TechDomainHome from "../../components/tech/TechDomainHome";
 import LearningPathScreen from "../../components/tech/LearningPathScreen";
 import LevelDetailScreen from "../../components/tech/LevelDetailScreen";
+import TechDomainHome from "../../components/tech/TechDomainHome";
+import {
+    calculateLevelAvg,
+    checkBadges,
+    createDefaultLearningState,
+    getNextQuestionId,
+    LearningPathState,
+    QuestionScore,
+    shouldUnlockNext,
+    TECH_BADGES,
+    TECH_LEARNING_LEVELS,
+} from "../../constants/learningPath";
+import {
+    buildTechPrompt,
+    getRandomQuestion,
+    InterviewResult,
+} from "../../constants/questions";
+import {
+    Colors,
+    DomainColors,
+    Radius,
+    Shadows,
+    Spacing,
+    Typography,
+} from "../../constants/theme";
 
 // ─── Screens ─────────────────────────────────────────────────────
 type Screen =
@@ -119,24 +119,57 @@ export default function TechInterview() {
     try {
       const prompt = buildTechPrompt(question, answer);
 
-      const GEMINI_API_KEY = "YOUR_GEMINI_API_KEY";
+      const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+      if (!GEMINI_API_KEY) {
+        throw new Error("Missing GEMINI_API_KEY environment variable");
+      }
       const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
 
-      const response = await fetch(API_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 1024,
-          },
-        }),
+      const requestBody = JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 2048,
+          responseMimeType: "application/json",
+        },
       });
+
+      // Retry up to 3 times on 429 rate-limit errors
+      let response: Response | null = null;
+      const maxRetries = 3;
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        response = await fetch(API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: requestBody,
+        });
+
+        if (response.status === 429 && attempt < maxRetries) {
+          const waitSec = Math.pow(2, attempt + 1) * 5; // 10s, 20s, 40s
+          console.log(`Rate limited, retrying in ${waitSec}s (attempt ${attempt + 1}/${maxRetries})...`);
+          await new Promise((r) => setTimeout(r, waitSec * 1000));
+          continue;
+        }
+        break;
+      }
+
+      if (!response || !response.ok) {
+        const errBody = await response?.text();
+        if (response?.status === 429) {
+          throw new Error("RATE_LIMITED");
+        }
+        throw new Error(`Gemini API ${response?.status}: ${errBody}`);
+      }
 
       const data = await response.json();
       const rawText =
         data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+
+      if (!rawText) {
+        const finishReason = data?.candidates?.[0]?.finishReason ?? "UNKNOWN";
+        throw new Error(`Empty response from Gemini (finishReason: ${finishReason})`);
+      }
+
       const jsonStr = rawText
         .replace(/```json\s*/gi, "")
         .replace(/```\s*/gi, "")
@@ -148,33 +181,17 @@ export default function TechInterview() {
         recordLearningScore(parsed);
       }
       setScreen("results");
-    } catch (err) {
+    } catch (err: any) {
       console.error("Gemini error:", err);
-      const fallback: InterviewResult = {
-        structureScore: 7,
-        clarityScore: 8,
-        technicalScore: 6,
-        averageScore: 7,
-        strengths: [
-          "Good problem decomposition",
-          "Clear logical flow",
-          "Mentioned relevant technologies",
-        ],
-        improvements: [
-          "Could discuss trade-offs more explicitly",
-          "Missing error handling considerations",
-          "Add more specific technical details",
-        ],
-        coachingTip:
-          "Start with clarifying requirements before jumping into the solution.",
-        followUpQuestion:
-          "How would you scale this system to handle 10x the current traffic?",
-      };
-      setResult(fallback);
-      if (mode === "learning" && currentLearningQId) {
-        recordLearningScore(fallback);
-      }
-      setScreen("results");
+      const isRateLimit = err?.message === "RATE_LIMITED";
+      Alert.alert(
+        isRateLimit ? "Rate Limit Reached" : "Analysis Failed",
+        isRateLimit
+          ? "You've hit the Gemini API free-tier limit. Please wait a minute and try again."
+          : "Could not get a review from Gemini. Please check your internet connection and try again.",
+        [{ text: "OK" }]
+      );
+      setScreen("question");
     }
   }, [answer, question, mode, currentLearningQId]);
 
